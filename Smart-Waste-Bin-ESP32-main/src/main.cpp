@@ -4,25 +4,24 @@
 #include "S3Communicator.h"
 #include "../include/Config.h"
 
-// تعريف الكائنات (Objects) - تم إزالة السيرفر
+// تعريف كائنات التحكم بالعتاد والاتصال المباشر بالسيريال (تم إلغاء نظام السيرفر الداخلي والشبكة)
 SensorManager sensor;
 MotorController motor; 
 S3Communicator s3Comm;
 
-// متغيرات التحكم في الوقت والحالة
 unsigned long stateStartTime = 0;
 
 enum InternalState { WAITING_FOR_USER, SESSION_ACTIVE };
 InternalState currentState = WAITING_FOR_USER;
 
 void setup() {
-    // 1. تهيئة السيريال مونيتور للكمبيوتر
+    // تهيئة مخرج المراقبة والتحكم الخاص بالكمبيوتر
     Serial.begin(115200);
     
-    // 2. إعداد الزرار (GPIO 12) مع المقاومة الداخلية
+    // تهيئة زر المقاطعة والإغلاق اليدوي (GPIO 12) مع المقاومة الداخلية
     pinMode(BUTTON_PIN, INPUT_PULLUP);
     
-    // 3. تهيئة الأجزاء المختلفة من السيستم
+    // إعداد الحساسات الفردية والمحركات وخطوط الاتصال مع البوردة العليا S3
     sensor.init();
     motor.init(); 
     s3Comm.init();
@@ -37,94 +36,84 @@ void loop() {
     switch (currentState) {
         
         // ==========================================
-        // حالة الانتظار: مستني رسالة من الـ ESP32-S3
+        // حالة الانتظار: مراقبة خط السيريال بانتظار إشارة البدء الفعلي من S3
         // ==========================================
         case WAITING_FOR_USER:
-            // فحص السيريال 2 لاكتشاف رسالة البدء
             if (Serial2.available()) {
                 String incomingMsg = Serial2.readStringUntil('\n');
                 
-                // >>> فلتر التنظيف الشامل (Bulletproof Filter) <<<
+                // تنظيف شامل للحروف والرموز المستقبلة لمنع حدوث مشاكل بسبب أي تشويش رقمي بالأسلاك
                 String cleanMsg = "";
                 for (int i = 0; i < incomingMsg.length(); i++) {
                     char c = incomingMsg[i];
-                    // isAlphaNumeric بتاخد الحروف والأرقام الصريحة بس وترمي أي شوشرة مخفية
                     if (isAlphaNumeric(c)) {
                         cleanMsg += c;
                     }
                 }
                 
-                // نطبع الكلمة بعد التنظيف بين قوسين عشان نتأكد إن مفيش هوا معاها
                 Serial.println("DEBUG Clean: [" + cleanMsg + "]");
                 
-                // دلوقتي نقدر نفحص وإحنا مطمنين 100%
                 if (cleanMsg == "start") {
                     currentState = SESSION_ACTIVE;
-                    stateStartTime = millis(); // تصفير العداد لبدء الـ 30 ثانية
+                    stateStartTime = millis(); // تصفير العداد لبدء دورة الـ 30 ثانية للجلسة
                     Serial.println(">>> SESSION STARTED via Serial2: Waiting for items...");
                 }
             }
             break;
 
         // ==========================================
-        // حالة الجلسة النشطة: نفس اللوجيك بتاعك بالظبط
+        // حالة الجلسة النشطة: قراءة المدخلات، فرز النفايات الميكانيكي، وحساب الوزن
         // ==========================================
         case SESSION_ACTIVE:
-            // 1. حساب الوقت المتبقي (تم الاحتفاظ باللوجيك مع إزالة السيرفر)
-            int remaining = 30 - ((now - stateStartTime) / 1000);
-
-            // 2. فحص الزرار لإنهاء الجلسة يدوياً (في حالة عدم حركة الموتور)
+            // 1. مراقبة زر المقاطعة لإنهاء الجلسة فوراً بطلب من المستخدم
             if (digitalRead(BUTTON_PIN) == LOW) {
                 Serial.println(">>> Manual End: Button Pressed.");
-                // إرسال 40 نقطة و 1.5 كجم كقيمة تقريبية للوزن
-                s3Comm.sendSessionEnd(40, 1.5); 
+                s3Comm.sendSessionEnd(40); // إرسال نقاط الدفعة القياسية عند الإغلاق المفاجئ
                 currentState = WAITING_FOR_USER;
                 stateStartTime = now;
                 delay(250); 
                 break; 
             }
 
-            // 3. فحص الحساسات لاكتشاف نوع النفايات
+            // 2. فحص الحساسات لاكتشاف سقوط النفايات ونوعها (معدن / بلاستيك) على بوابة السلة
             int type = sensor.checkWasteTypeOnLid(); 
             
             if (type != 0) { 
                 bool completedProperly = true;
 
-                if (type == 2) { // Metal
+                if (type == 2) { // نفايات معدنية
                     Serial.println("Action: Sorting Metal...");
                     motor.tiltToMetal();   
                     delay(1500); 
                     completedProperly = motor.resetToCenter(); 
                 } 
-                else if (type == 1) { // Plastic
+                else if (type == 1) { // نفايات بلاستيكية
                     Serial.println("Action: Sorting Plastic...");
                     motor.tiltToPlastic(); 
                     delay(1500);           
                     completedProperly = motor.resetToCenter(); 
                 }
 
-                // *** تعديل هام: لو الزرار اتداس أثناء حركة الموتور ***
+                // التحقق الفوري ما إذا تم الضغط على زر المقاطعة أثناء عمل محرك الفرز
                 if (!completedProperly) {
                     Serial.println(">>> Interrupt detected! Forcing IDLE state...");
-                    // إرسال 40 نقطة و 1.5 كجم كقيمة تقريبية للوزن
-                    s3Comm.sendSessionEnd(40, 1.5); 
+                    s3Comm.sendSessionEnd(40);
                     currentState = WAITING_FOR_USER;
                     stateStartTime = millis(); 
-                    return; // إنهاء اللفة الحالية فوراً للعودة لحالة الانتظار
+                    return;
                 }
 
-                // تحديث البيانات من الحساسات بعد الرمي الناجح
+                // تحديث نسب الامتلاء الفعلية للحجرات بعد إتمام عملية الفرز وإرسالها لـ S3
                 float currentPlasticLevel = sensor.getPlasticLevelPercentage();
                 float currentMetalLevel = sensor.getMetalLevelPercentage();
-                s3Comm.sendItemUpdate(type, currentPlasticLevel, currentMetalLevel, 0.0, 0.0);
+                s3Comm.sendItemUpdate(type, currentPlasticLevel, currentMetalLevel, 25.5, 0.0); // قيم افتراضية ثابتة للوزن
                 Serial.println(">>> Sorting Complete. Ready for next item.");
             }
 
-            // 4. إنهاء الجلسة تلقائياً عند انتهاء الوقت (اللوجيك كما هو)
+            // 3. الإغلاق التلقائي الآمن للجلسة عند تخطي مهلة الـ 30 ثانية دون إدخال نفايات جديدة
             if (now - stateStartTime > 30000) {
                 Serial.println(">>> Session Timeout (30s). Returning to IDLE.");
-                // إرسال 40 نقطة و 1.5 كجم كقيمة تقريبية للوزن
-                s3Comm.sendSessionEnd(40, 1.5); 
+                s3Comm.sendSessionEnd(40);
                 currentState = WAITING_FOR_USER;
                 stateStartTime = now;
             }
